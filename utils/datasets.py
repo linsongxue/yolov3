@@ -8,6 +8,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 import torch
+from PIL import Image, ExifTags
 from torch.utils.data import Dataset
 from tqdm import tqdm
 
@@ -16,14 +17,33 @@ from utils.utils import xyxy2xywh, xywh2xyxy
 img_formats = ['.bmp', '.jpg', '.jpeg', '.png', '.tif']
 vid_formats = ['.mov', '.avi', '.mp4']
 
+# Get orientation exif tag
+for orientation in ExifTags.TAGS.keys():
+    if ExifTags.TAGS[orientation] == 'Orientation':
+        break
+
+
+def exif_size(img):
+    # Returns exif-corrected PIL size
+    s = img.size  # (width, height)
+    try:
+        rotation = dict(img._getexif().items())[orientation]
+        if rotation == 6:  # rotation 270
+            s = (s[1], s[0])
+        elif rotation == 8:  # rotation 90
+            s = (s[1], s[0])
+    except:
+        None
+
+    return s
+
 
 class LoadImages:  # for inference
-    def __init__(self, path, img_size=416):
-        self.height = img_size
-
+    def __init__(self, path, img_size=416, half=False):
+        path = str(Path(path))  # os-agnostic
         files = []
         if os.path.isdir(path):
-            files = sorted(glob.glob('%s/*.*' % path))
+            files = sorted(glob.glob(os.path.join(path, '*.*')))
         elif os.path.isfile(path):
             files = [path]
 
@@ -31,10 +51,12 @@ class LoadImages:  # for inference
         videos = [x for x in files if os.path.splitext(x)[-1].lower() in vid_formats]
         nI, nV = len(images), len(videos)
 
+        self.img_size = img_size
         self.files = images + videos
         self.nF = nI + nV  # number of files
         self.video_flag = [False] * nI + [True] * nV
         self.mode = 'images'
+        self.half = half  # half precision fp16 images
         if any(videos):
             self.new_video(videos[0])  # new video
         else:
@@ -75,11 +97,11 @@ class LoadImages:  # for inference
             print('image %g/%g %s: ' % (self.count, self.nF, path), end='')
 
         # Padded resize
-        img, *_ = letterbox(img0, new_shape=self.height)
+        img, *_ = letterbox(img0, new_shape=self.img_size)
 
         # Normalize RGB
         img = img[:, :, ::-1].transpose(2, 0, 1)  # BGR to RGB
-        img = np.ascontiguousarray(img, dtype=np.float32)  # uint8 to float32
+        img = np.ascontiguousarray(img, dtype=np.float16 if self.half else np.float32)  # uint8 to fp16/fp32
         img /= 255.0  # 0 - 255 to 0.0 - 1.0
 
         # cv2.imwrite(path + '.letterbox.jpg', 255 * img.transpose((1, 2, 0))[:, :, ::-1])  # save letterbox image
@@ -95,9 +117,12 @@ class LoadImages:  # for inference
 
 
 class LoadWebcam:  # for inference
-    def __init__(self, img_size=416):
-        self.cam = cv2.VideoCapture(0)
-        self.height = img_size
+    def __init__(self, img_size=416, half=False):
+        self.img_size = img_size
+        self.half = half  # half precision fp16 images
+        self.cam = cv2.VideoCapture(0)  # local camera
+        # self.cam = cv2.VideoCapture('rtsp://192.168.1.64/1')  # IP camera
+        # self.cam = cv2.VideoCapture('rtsp://username:password@192.168.1.64/1')  # IP camera with login
 
     def __iter__(self):
         self.count = -1
@@ -117,11 +142,11 @@ class LoadWebcam:  # for inference
         print('webcam %g: ' % self.count, end='')
 
         # Padded resize
-        img, *_ = letterbox(img0, new_shape=self.height)
+        img, *_ = letterbox(img0, new_shape=self.img_size)
 
         # Normalize RGB
         img = img[:, :, ::-1].transpose(2, 0, 1)  # BGR to RGB
-        img = np.ascontiguousarray(img, dtype=np.float32)  # uint8 to float32
+        img = np.ascontiguousarray(img, dtype=np.float16 if self.half else np.float32)  # uint8 to fp16/fp32
         img /= 255.0  # 0 - 255 to 0.0 - 1.0
 
         return img_path, img, img0, None
@@ -131,10 +156,11 @@ class LoadWebcam:  # for inference
 
 
 class LoadImagesAndLabels(Dataset):  # for training/testing
-    def __init__(self, path, img_size=416, batch_size=16, augment=False, rect=True, image_weights=False):
+    def __init__(self, path, img_size=416, batch_size=16, augment=False, hyp=None, rect=True, image_weights=False):
+        path = str(Path(path))  # os-agnostic
         with open(path, 'r') as f:
-            img_files = f.read().splitlines()
-            self.img_files = [x for x in img_files if os.path.splitext(x)[-1].lower() in img_formats]
+            self.img_files = [x.replace('/', os.sep) for x in f.read().splitlines()  # os-agnostic
+                              if os.path.splitext(x)[-1].lower() in img_formats]
 
         n = len(self.img_files)
         bi = np.floor(np.arange(n) / batch_size).astype(np.int)  # batch index
@@ -145,6 +171,7 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         self.batch = bi  # batch index of image
         self.img_size = img_size
         self.augment = augment
+        self.hyp = hyp
         self.image_weights = image_weights
         self.rect = False if image_weights else rect
 
@@ -154,19 +181,18 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
 
         # Rectangular Training  https://github.com/ultralytics/yolov3/issues/232
         if self.rect:
-            from PIL import Image
-
             # Read image shapes
             sp = 'data' + os.sep + path.replace('.txt', '.shapes').split(os.sep)[-1]  # shapefile path
-            if os.path.exists(sp):  # read existing shapefile
-                with open(sp, 'r') as f:
-                    s = np.array([x.split() for x in f.read().splitlines()], dtype=np.float32)
-                assert len(s) == n, 'Shapefile out of sync, please delete %s and rerun' % sp
-            else:  # no shapefile, so read shape using PIL and write shapefile for next time (faster)
-                s = np.array([Image.open(f).size for f in tqdm(self.img_files, desc='Reading image shapes')])
-                np.savetxt(sp, s, fmt='%g')
+            try:
+                with open(sp, 'r') as f:  # read existing shapefile
+                    s = [x.split() for x in f.read().splitlines()]
+                    assert len(s) == n, 'Shapefile out of sync'
+            except:
+                s = [exif_size(Image.open(f)) for f in tqdm(self.img_files, desc='Reading image shapes')]
+                np.savetxt(sp, s, fmt='%g')  # overwrites existing (if any)
 
             # Sort by aspect ratio
+            s = np.array(s, dtype=np.float64)
             ar = s[:, 1] / s[:, 0]  # aspect ratio
             i = ar.argsort()
             self.img_files = [self.img_files[i] for i in i]
@@ -189,11 +215,10 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         self.imgs = [None] * n
         self.labels = [None] * n
         preload_labels = False
-        if preload_labels:
+        if preload_labels or image_weights:
             self.labels = [np.zeros((0, 5))] * n
-            iter = tqdm(self.label_files, desc='Reading labels') if n > 10 else self.label_files
             extract_bounding_boxes = False
-            for i, file in enumerate(iter):
+            for i, file in enumerate(tqdm(self.label_files, desc='Reading labels') if n > 10 else self.label_files):
                 try:
                     with open(file, 'r') as f:
                         l = np.array([x.split() for x in f.read().splitlines()], dtype=np.float32)
@@ -223,6 +248,16 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                     pass  # print('Warning: missing labels for %s' % self.img_files[i])  # missing label file
             assert len(np.concatenate(self.labels, 0)) > 0, 'No labels found. Incorrect label paths provided.'
 
+        # Detect corrupted images https://medium.com/joelthchao/programmatically-detect-corrupted-image-8c1b2006c3d3
+        detect_corrupted_images = False
+        if detect_corrupted_images:
+            from skimage import io  # conda install -c conda-forge scikit-image
+            for file in tqdm(self.img_files, desc='Detecting corrupted images'):
+                try:
+                    _ = io.imread(file)
+                except:
+                    print('Corrupted image detected: %s' % file)
+
     def __len__(self):
         return len(self.img_files)
 
@@ -238,26 +273,31 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
 
         img_path = self.img_files[index]
         label_path = self.label_files[index]
+        hyp = self.hyp
 
         # Load image
         img = self.imgs[index]
         if img is None:
             img = cv2.imread(img_path)  # BGR
             assert img is not None, 'File Not Found ' + img_path
-            if self.n < 1001:
-                self.imgs[index] = img  # cache image into memory
+            r = self.img_size / max(img.shape)  # size ratio
+            if self.augment and r < 1:  # if training (NOT testing), downsize to inference shape
+                h, w, _ = img.shape
+                img = cv2.resize(img, (int(w * r), int(h * r)), interpolation=cv2.INTER_LINEAR)  # INTER_LINEAR fastest
+
+            if self.n < 5000:  # cache into memory if image count < 5000
+                self.imgs[index] = img
 
         # Augment colorspace
         augment_hsv = True
         if self.augment and augment_hsv:
             # SV augmentation by 50%
-            fraction = 0.50  # must be < 1.0
             img_hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)  # hue, sat, val
             S = img_hsv[:, :, 1].astype(np.float32)  # saturation
             V = img_hsv[:, :, 2].astype(np.float32)  # value
 
-            a = (random.random() * 2 - 1) * fraction + 1
-            b = (random.random() * 2 - 1) * fraction + 1
+            a = random.uniform(-1, 1) * hyp['hsv_s'] + 1
+            b = random.uniform(-1, 1) * hyp['hsv_v'] + 1
             S *= a
             V *= b
 
@@ -293,7 +333,11 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
 
         # Augment image and labels
         if self.augment:
-            img, labels = random_affine(img, labels, degrees=(-5, 5), translate=(0.10, 0.10), scale=(0.90, 1.10))
+            img, labels = random_affine(img, labels,
+                                        degrees=hyp['degrees'],
+                                        translate=hyp['translate'],
+                                        scale=hyp['scale'],
+                                        shear=hyp['shear'])
 
         nL = len(labels)  # number of labels
         if nL:
@@ -338,10 +382,11 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         return torch.stack(img, 0), torch.cat(label, 0), path, hw
 
 
-def letterbox(img, new_shape=416, color=(127.5, 127.5, 127.5), mode='auto'):
+def letterbox(img, new_shape=416, color=(128, 128, 128), mode='auto'):
     # Resize a rectangular image to a 32 pixel multiple rectangle
     # https://github.com/ultralytics/yolov3/issues/232
     shape = img.shape[:2]  # current shape [height, width]
+
     if isinstance(new_shape, int):
         ratio = float(new_shape) / max(shape)
     else:
@@ -364,15 +409,15 @@ def letterbox(img, new_shape=416, color=(127.5, 127.5, 127.5), mode='auto'):
         new_unpad = (new_shape, new_shape)
         ratiow, ratioh = new_shape / shape[1], new_shape / shape[0]
 
+    if shape[::-1] != new_unpad:  # resize
+        img = cv2.resize(img, new_unpad, interpolation=cv2.INTER_AREA)  # INTER_AREA is better, INTER_LINEAR is faster
     top, bottom = int(round(dh - 0.1)), int(round(dh + 0.1))
     left, right = int(round(dw - 0.1)), int(round(dw + 0.1))
-    img = cv2.resize(img, new_unpad, interpolation=cv2.INTER_AREA)  # resized, no border
-    img = cv2.copyMakeBorder(img, top, bottom, left, right, cv2.BORDER_CONSTANT, value=color)  # padded square
+    img = cv2.copyMakeBorder(img, top, bottom, left, right, cv2.BORDER_CONSTANT, value=color)  # add border
     return img, ratiow, ratioh, dw, dh
 
 
-def random_affine(img, targets=(), degrees=(-10, 10), translate=(.1, .1), scale=(.9, 1.1), shear=(-2, 2),
-                  borderValue=(127.5, 127.5, 127.5)):
+def random_affine(img, targets=(), degrees=10, translate=.1, scale=.1, shear=10):
     # torchvision.transforms.RandomAffine(degrees=(-10, 10), translate=(.1, .1), scale=(.9, 1.1), shear=(-10, 10))
     # https://medium.com/uruvideo/dataset-augmentation-with-random-homographies-a8f4b44830d4
 
@@ -384,24 +429,24 @@ def random_affine(img, targets=(), degrees=(-10, 10), translate=(.1, .1), scale=
 
     # Rotation and Scale
     R = np.eye(3)
-    a = random.random() * (degrees[1] - degrees[0]) + degrees[0]
-    # a += random.choice([-180, -90, 0, 90])  # 90deg rotations added to small rotations
-    s = random.random() * (scale[1] - scale[0]) + scale[0]
+    a = random.uniform(-degrees, degrees)
+    # a += random.choice([-180, -90, 0, 90])  # add 90deg rotations to small rotations
+    s = random.uniform(1 - scale, 1 + scale)
     R[:2] = cv2.getRotationMatrix2D(angle=a, center=(img.shape[1] / 2, img.shape[0] / 2), scale=s)
 
     # Translation
     T = np.eye(3)
-    T[0, 2] = (random.random() * 2 - 1) * translate[0] * img.shape[0] + border  # x translation (pixels)
-    T[1, 2] = (random.random() * 2 - 1) * translate[1] * img.shape[1] + border  # y translation (pixels)
+    T[0, 2] = random.uniform(-translate, translate) * img.shape[0] + border  # x translation (pixels)
+    T[1, 2] = random.uniform(-translate, translate) * img.shape[1] + border  # y translation (pixels)
 
     # Shear
     S = np.eye(3)
-    S[0, 1] = math.tan((random.random() * (shear[1] - shear[0]) + shear[0]) * math.pi / 180)  # x shear (deg)
-    S[1, 0] = math.tan((random.random() * (shear[1] - shear[0]) + shear[0]) * math.pi / 180)  # y shear (deg)
+    S[0, 1] = math.tan(random.uniform(-shear, shear) * math.pi / 180)  # x shear (deg)
+    S[1, 0] = math.tan(random.uniform(-shear, shear) * math.pi / 180)  # y shear (deg)
 
     M = S @ T @ R  # Combined rotation matrix. ORDER IS IMPORTANT HERE!!
     imw = cv2.warpAffine(img, M[:2], dsize=(width, height), flags=cv2.INTER_AREA,
-                         borderValue=borderValue)  # BGR order borderValue
+                         borderValue=(128, 128, 128))  # BGR order borderValue
 
     # Return warped points also
     if len(targets) > 0:
