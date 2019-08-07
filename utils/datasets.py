@@ -93,7 +93,7 @@ class LoadImages:  # for inference
             # Read image
             self.count += 1
             img0 = cv2.imread(path)  # BGR
-            assert img0 is not None, 'File Not Found ' + path
+            assert img0 is not None, 'Image Not Found ' + path
             print('image %g/%g %s: ' % (self.count, self.nF, path), end='')
 
         # Padded resize
@@ -214,39 +214,57 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         # Preload labels (required for weighted CE training)
         self.imgs = [None] * n
         self.labels = [None] * n
-        preload_labels = False
-        if preload_labels or image_weights:
+        if augment or image_weights:  # cache labels for faster training
             self.labels = [np.zeros((0, 5))] * n
             extract_bounding_boxes = False
-            for i, file in enumerate(tqdm(self.label_files, desc='Reading labels') if n > 10 else self.label_files):
+            pbar = tqdm(self.label_files, desc='Reading labels')
+            nm, nf, ne = 0, 0, 0  # number missing, number found, number empty
+            for i, file in enumerate(pbar):
                 try:
                     with open(file, 'r') as f:
                         l = np.array([x.split() for x in f.read().splitlines()], dtype=np.float32)
-                        if l.shape[0]:
-                            assert l.shape[1] == 5, '> 5 label columns: %s' % file
-                            assert (l >= 0).all(), 'negative labels: %s' % file
-                            assert (l[:, 1:] <= 1).all(), 'non-normalized or out of bounds coordinate labels: %s' % file
-                            self.labels[i] = l
-
-                            # Extract object detection boxes for a second stage classifier
-                            if extract_bounding_boxes:
-                                p = Path(self.img_files[i])
-                                img = cv2.imread(str(p))
-                                h, w, _ = img.shape
-                                for j, x in enumerate(l):
-                                    f = '%s%sclassification%s%g_%g_%s' % (
-                                        p.parent.parent, os.sep, os.sep, x[0], j, p.name)
-                                    if not os.path.exists(Path(f).parent):
-                                        os.makedirs(Path(f).parent)  # make new output folder
-                                    box = xywh2xyxy(x[1:].reshape(-1, 4)).ravel()
-                                    box = np.clip(box, 0, 1)  # clip boxes outside of image
-                                    result = cv2.imwrite(f, img[int(box[1] * h):int(box[3] * h),
-                                                            int(box[0] * w):int(box[2] * w)])
-                                    if not result:
-                                        print('stop')
                 except:
-                    pass  # print('Warning: missing labels for %s' % self.img_files[i])  # missing label file
-            assert len(np.concatenate(self.labels, 0)) > 0, 'No labels found. Incorrect label paths provided.'
+                    nm += 1  # print('missing labels for image %s' % self.img_files[i])  # file missing
+                    continue
+
+                if l.shape[0]:
+                    assert l.shape[1] == 5, '> 5 label columns: %s' % file
+                    assert (l >= 0).all(), 'negative labels: %s' % file
+                    assert (l[:, 1:] <= 1).all(), 'non-normalized or out of bounds coordinate labels: %s' % file
+                    self.labels[i] = l
+                    nf += 1  # file found
+
+                    # Extract object detection boxes for a second stage classifier
+                    if extract_bounding_boxes:
+                        p = Path(self.img_files[i])
+                        img = cv2.imread(str(p))
+                        h, w, _ = img.shape
+                        for j, x in enumerate(l):
+                            f = '%s%sclassifier%s%g_%g_%s' % (p.parent.parent, os.sep, os.sep, x[0], j, p.name)
+                            if not os.path.exists(Path(f).parent):
+                                os.makedirs(Path(f).parent)  # make new output folder
+                            box = xywh2xyxy(x[1:].reshape(-1, 4)).ravel()
+                            b = np.clip(box, 0, 1)  # clip boxes outside of image
+                            ret_val = cv2.imwrite(f, img[int(b[1] * h):int(b[3] * h), int(b[0] * w):int(b[2] * w)])
+                            assert ret_val, 'Failure extracting classifier boxes'
+                else:
+                    ne += 1  # file empty
+
+                pbar.desc = 'Reading labels (%g found, %g missing, %g empty for %g images)' % (nf, nm, ne, n)
+            assert nf > 0, 'No labels found. Recommend correcting image and label paths.'
+
+        # Cache images into memory for faster training (~5GB)
+        cache_images = False
+        if cache_images and augment:  # if training
+            for i in tqdm(range(min(len(self.img_files), 10000)), desc='Reading images'):  # max 10k images
+                img_path = self.img_files[i]
+                img = cv2.imread(img_path)  # BGR
+                assert img is not None, 'Image Not Found ' + img_path
+                r = self.img_size / max(img.shape)  # size ratio
+                if self.augment and r < 1:  # if training (NOT testing), downsize to inference shape
+                    h, w, _ = img.shape
+                    img = cv2.resize(img, (int(w * r), int(h * r)), interpolation=cv2.INTER_LINEAR)  # or INTER_AREA
+                self.imgs[i] = img
 
         # Detect corrupted images https://medium.com/joelthchao/programmatically-detect-corrupted-image-8c1b2006c3d3
         detect_corrupted_images = False
@@ -279,14 +297,11 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         img = self.imgs[index]
         if img is None:
             img = cv2.imread(img_path)  # BGR
-            assert img is not None, 'File Not Found ' + img_path
+            assert img is not None, 'Image Not Found ' + img_path
             r = self.img_size / max(img.shape)  # size ratio
             if self.augment and r < 1:  # if training (NOT testing), downsize to inference shape
                 h, w, _ = img.shape
                 img = cv2.resize(img, (int(w * r), int(h * r)), interpolation=cv2.INTER_LINEAR)  # INTER_LINEAR fastest
-
-            if self.n < 5000:  # cache into memory if image count < 5000
-                self.imgs[index] = img
 
         # Augment colorspace
         augment_hsv = True
@@ -321,7 +336,6 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
             if x is None:  # labels not preloaded
                 with open(label_path, 'r') as f:
                     x = np.array([x.split() for x in f.read().splitlines()], dtype=np.float32)
-                    self.labels[index] = x  # save for next time
 
             if x.size > 0:
                 # Normalized xywh to pixel xyxy format

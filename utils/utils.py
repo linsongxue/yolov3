@@ -180,18 +180,25 @@ def ap_per_class(tp, conf, pred_cls, target_cls):
             tpc = (tp[i]).cumsum()
 
             # Recall
-            recall_curve = tpc / (n_gt + 1e-16)
-            r.append(recall_curve[-1])
+            recall = tpc / (n_gt + 1e-16)  # recall curve
+            r.append(recall[-1])
 
             # Precision
-            precision_curve = tpc / (tpc + fpc)
-            p.append(precision_curve[-1])
+            precision = tpc / (tpc + fpc)  # precision curve
+            p.append(precision[-1])
 
             # AP from recall-precision curve
-            ap.append(compute_ap(recall_curve, precision_curve))
+            ap.append(compute_ap(recall, precision))
 
             # Plot
-            # plt.plot(recall_curve, precision_curve)
+            # fig, ax = plt.subplots(1, 1, figsize=(4, 4))
+            # ax.plot(np.concatenate(([0.], recall)), np.concatenate(([0.], precision)))
+            # ax.set_xlabel('YOLOv3-SPP')
+            # ax.set_xlabel('Recall')
+            # ax.set_ylabel('Precision')
+            # ax.set_xlim(0, 1)
+            # fig.tight_layout()
+            # fig.savefig('PR_curve.png', dpi=300)
 
     # Compute F1 score (harmonic mean of precision and recall)
     p, r, ap = np.array(p), np.array(r), np.array(ap)
@@ -209,21 +216,18 @@ def compute_ap(recall, precision):
     # Returns
         The average precision as computed in py-faster-rcnn.
     """
-    # correct AP calculation
-    # first append sentinel values at the end
-
+    # Append sentinel values to beginning and end
     mrec = np.concatenate(([0.], recall, [1.]))
     mpre = np.concatenate(([0.], precision, [0.]))
 
-    # compute the precision envelope
+    # Compute the precision envelope
     for i in range(mpre.size - 1, 0, -1):
         mpre[i - 1] = np.maximum(mpre[i - 1], mpre[i])
 
-    # to calculate area under PR curve, look for points
-    # where X axis (recall) changes value
+    # Calculate area under PR curve, looking for points where x axis (recall) changes
     i = np.where(mrec[1:] != mrec[:-1])[0]
 
-    # and sum (\Delta recall) * prec
+    # Sum (\Delta recall) * prec
     ap = np.sum((mrec[i + 1] - mrec[i]) * mpre[i + 1])
     return ap
 
@@ -315,10 +319,11 @@ def compute_loss(p, targets, model, giou_loss=True):  # predictions, targets, mo
                 lxy += (k * h['xy']) * MSE(pxy, txy[i])  # xy loss
                 lwh += (k * h['wh']) * MSE(pi[..., 2:4], twh[i])  # wh yolo loss
 
-            tclsm = torch.zeros_like(pi[..., 5:])
-            tclsm[range(nb), tcls[i]] = 1.0
-            lcls += (k * h['cls']) * BCEcls(pi[..., 5:], tclsm)  # cls loss (BCE)
-            # lcls += (k * h['cls']) * CE(pi[..., 5:], tcls[i])  # cls loss (CE)
+            if model.nc > 1:  # cls loss (only if multiple classes)
+                tclsm = torch.zeros_like(pi[..., 5:])
+                tclsm[range(nb), tcls[i]] = 1.0
+                lcls += (k * h['cls']) * BCEcls(pi[..., 5:], tclsm)  # BCE
+                # lcls += (k * h['cls']) * CE(pi[..., 5:], tcls[i])  # CE
 
             # Append targets to text file
             # with open('targets.txt', 'a') as file:
@@ -332,26 +337,28 @@ def compute_loss(p, targets, model, giou_loss=True):  # predictions, targets, mo
 
 def build_targets(model, targets):
     # targets = [image, class, x, y, w, h]
-    iou_thres = model.hyp['iou_t']  # hyperparameter
-    if type(model) in (nn.parallel.DataParallel, nn.parallel.DistributedDataParallel):
-        model = model.module
 
     nt = len(targets)
-    txy, twh, tcls, tbox, indices, anchor_vec = [], [], [], [], [], []
+    txy, twh, tcls, tbox, indices, av = [], [], [], [], [], []
+    multi_gpu = type(model) in (nn.parallel.DataParallel, nn.parallel.DistributedDataParallel)
     for i in model.yolo_layers:
-        layer = model.module_list[i]
+        # get number of grid points and anchor vec for this yolo layer
+        if multi_gpu:
+            ng, anchor_vec = model.module.module_list[i].ng, model.module.module_list[i].anchor_vec
+        else:
+            ng, anchor_vec = model.module_list[i].ng, model.module_list[i].anchor_vec
 
         # iou of targets-anchors
         t, a = targets, []
-        gwh = t[:, 4:6] * layer.ng
+        gwh = t[:, 4:6] * ng
         if nt:
-            iou = torch.stack([wh_iou(x, gwh) for x in layer.anchor_vec], 0)
+            iou = torch.stack([wh_iou(x, gwh) for x in anchor_vec], 0)
 
             use_best_anchor = False
             if use_best_anchor:
                 iou, a = iou.max(0)  # best iou and anchor
             else:  # use all anchors
-                na = len(layer.anchor_vec)  # number of anchors
+                na = len(anchor_vec)  # number of anchors
                 a = torch.arange(na).view((-1, 1)).repeat([1, nt]).view(-1)
                 t = targets.repeat([na, 1])
                 gwh = gwh.repeat([na, 1])
@@ -360,12 +367,12 @@ def build_targets(model, targets):
             # reject anchors below iou_thres (OPTIONAL, increases P, lowers R)
             reject = True
             if reject:
-                j = iou > iou_thres
+                j = iou > model.hyp['iou_t']  # iou threshold hyperparameter
                 t, a, gwh = t[j], a[j], gwh[j]
 
         # Indices
         b, c = t[:, :2].long().t()  # target image, class
-        gxy = t[:, 2:4] * layer.ng  # grid x, y
+        gxy = t[:, 2:4] * ng  # grid x, y
         gi, gj = gxy.long().t()  # grid x, y indices
         indices.append((b, a, gj, gi))
 
@@ -375,18 +382,18 @@ def build_targets(model, targets):
 
         # GIoU
         tbox.append(torch.cat((gxy, gwh), 1))  # xywh (grids)
-        anchor_vec.append(layer.anchor_vec[a])
+        av.append(anchor_vec[a])  # anchor vec
 
         # Width and height
-        twh.append(torch.log(gwh / layer.anchor_vec[a]))  # wh yolo method
-        # twh.append((gwh / layer.anchor_vec[a]) ** (1 / 3) / 2)  # wh power method
+        twh.append(torch.log(gwh / anchor_vec[a]))  # wh yolo method
+        # twh.append((gwh / anchor_vec[a]) ** (1 / 3) / 2)  # wh power method
 
         # Class
         tcls.append(c)
-        if c.shape[0]:
-            assert c.max() <= layer.nc, 'Target classes exceed model classes'
+        if c.shape[0]:  # if any targets
+            assert c.max() <= model.nc, 'Target classes exceed model classes'
 
-    return txy, twh, tcls, tbox, indices, anchor_vec
+    return txy, twh, tcls, tbox, indices, av
 
 
 def non_max_suppression(prediction, conf_thres=0.5, nms_thres=0.5):
@@ -750,13 +757,49 @@ def plot_evolution_results(hyp):  # from utils.utils import *; plot_evolution_re
 
 def plot_results(start=0, stop=0):  # from utils.utils import *; plot_results()
     # Plot training results files 'results*.txt'
-    # import os; os.system('wget https://storage.googleapis.com/ultralytics/yolov3/results_v3.txt')
+    fig, ax = plt.subplots(2, 5, figsize=(14, 7))
+    ax = ax.ravel()
+    s = ['GIoU', 'Confidence', 'Classification', 'Precision', 'Recall',
+         'val GIoU', 'val Confidence', 'val Classification', 'mAP', 'F1']
+    for f in sorted(glob.glob('results*.txt') + glob.glob('../../Downloads/results*.txt')):
+        results = np.loadtxt(f, usecols=[2, 4, 5, 9, 10, 13, 14, 15, 11, 12]).T
+        n = results.shape[1]  # number of rows
+        x = range(start, min(stop, n) if stop else n)
+        for i in range(10):
+            ax[i].plot(x, results[i, x], marker='.', label=f.replace('.txt', ''))
+            ax[i].set_title(s[i])
+    fig.tight_layout()
+    ax[4].legend()
+    fig.savefig('results.png', dpi=200)
 
+
+def plot_results_overlay(start=1, stop=0):  # from utils.utils import *; plot_results_overlay()
+    # Plot training results files 'results*.txt', overlaying train and val losses
+    s = ['train', 'train', 'train', 'Precision', 'mAP', 'val', 'val', 'val', 'Recall', 'F1']  # legends
+    t = ['GIoU', 'Confidence', 'Classification', 'P-R', 'mAP-F1']  # titles
+    for f in sorted(glob.glob('results*.txt') + glob.glob('../../Downloads/results*.txt')):
+        results = np.loadtxt(f, usecols=[2, 4, 5, 9, 11, 13, 14, 15, 10, 12]).T
+        n = results.shape[1]  # number of rows
+        x = range(start, min(stop, n) if stop else n)
+        fig, ax = plt.subplots(1, 5, figsize=(14, 3.5))
+        ax = ax.ravel()
+        for i in range(5):
+            for j in [i, i + 5]:
+                ax[i].plot(x, results[j, x], marker='.', label=s[j])
+            ax[i].set_title(t[i])
+            ax[i].legend()
+            ax[i].set_ylabel(f) if i == 0 else None  # add filename
+        fig.tight_layout()
+        fig.savefig(f.replace('.txt', '.png'), dpi=200)
+
+
+def plot_results_orig(start=0, stop=0):  # from utils.utils import *; plot_results_orig()
+    # Plot training results files 'results*.txt' in original format
     fig, ax = plt.subplots(2, 5, figsize=(14, 7))
     ax = ax.ravel()
     s = ['GIoU/XY', 'Width/Height', 'Confidence', 'Classification', 'Train Loss', 'Precision', 'Recall', 'mAP', 'F1',
          'Test Loss']
-    for f in sorted(glob.glob('results*.txt') + glob.glob('../../Downloads/results*.txt')):
+    for f in sorted(glob.glob('results*.txt') + glob.glob('../../Google Drive/results*.txt')):
         results = np.loadtxt(f, usecols=[2, 3, 4, 5, 6, 9, 10, 11, 12, 13]).T
         n = results.shape[1]  # number of rows
         x = range(start, min(stop, n) if stop else n)

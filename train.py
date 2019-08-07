@@ -7,7 +7,6 @@ import torch.optim.lr_scheduler as lr_scheduler
 
 import test  # import test.py to get mAP after each epoch
 from models import *
-from utils.adabound import *
 from utils.datasets import *
 from utils.utils import *
 
@@ -179,6 +178,7 @@ def train(cfg,
                                 world_size=1,  # number of nodes for distributed training
                                 rank=0)  # distributed training node rank
         model = torch.nn.parallel.DistributedDataParallel(model)
+        model.yolo_layers = model.module.yolo_layers  # move yolo layer indices to top level
 
     # Dataset
     dataset = LoadImagesAndLabels(train_path,
@@ -198,13 +198,14 @@ def train(cfg,
                                              collate_fn=dataset.collate_fn)
 
     # Start training
+    model.nc = nc  # attach number of classes to model
     model.hyp = hyp  # attach hyperparameters to model
     if dataset.image_weights:
         model.class_weights = labels_to_class_weights(dataset.labels, nc).to(device)  # attach class weights
     model_info(model, report='summary')  # 'full' or 'summary'
     nb = len(dataloader)
     maps = np.zeros(nc)  # mAP per class
-    results = (0, 0, 0, 0, 0)  # P, R, mAP, F1, test_loss
+    results = (0, 0, 0, 0, 0, 0, 0)  # P, R, mAP, F1, test_loss
     # n_burnin = min(round(nb / 5 + 1), 1000)  # burn-in batches
     t0 = time.time()
     for epoch in range(start_epoch, epochs):
@@ -344,7 +345,7 @@ if __name__ == '__main__':
     parser.add_argument('--rect', action='store_true', help='rectangular training')
     parser.add_argument('--resume', action='store_true', help='resume training flag')
     parser.add_argument('--transfer', action='store_true', help='transfer learning flag')
-    parser.add_argument('--num-workers', type=int, default=4, help='number of Pytorch DataLoader workers')
+    parser.add_argument('--num-workers', type=int, default=os.cpu_count(), help='DataLoader workers')
     parser.add_argument('--nosave', action='store_true', help='only save final checkpoint')
     parser.add_argument('--notest', action='store_true', help='only test final epoch')
     parser.add_argument('--xywh', action='store_true', help='use xywh loss instead of GIoU loss')
@@ -368,24 +369,24 @@ if __name__ == '__main__':
         if opt.bucket:
             os.system('gsutil cp gs://%s/evolve.txt .' % opt.bucket)  # download evolve.txt if exists
 
-        for _ in range(1):  # generations to evolve
+        for _ in range(100):  # generations to evolve
             if os.path.exists('evolve.txt'):  # if evolve.txt exists: select best hyps and mutate
                 # Get best hyperparameters
                 x = np.loadtxt('evolve.txt', ndmin=2)
                 x = x[fitness(x).argmax()]  # select best fitness hyps
                 for i, k in enumerate(hyp.keys()):
-                    hyp[k] = x[i + 5]
+                    hyp[k] = x[i + 7]
 
                 # Mutate
                 init_seeds(seed=int(time.time()))
-                s = [.15, .15, .15, .15, .15, .15, .15, .15, .15, .00, .05, .20, .20, .20, .20, .20, .20, .20]  # sigmas
+                s = [.15, .15, .15, .15, .15, .15, .15, .15, .15, .00, .02, .20, .20, .20, .20, .20, .20, .20]  # sigmas
                 for i, k in enumerate(hyp.keys()):
                     x = (np.random.randn(1) * s[i] + 1) ** 2.0  # plt.hist(x.ravel(), 300)
                     hyp[k] *= float(x)  # vary by sigmas
 
             # Clip to limits
             keys = ['lr0', 'iou_t', 'momentum', 'weight_decay', 'hsv_s', 'hsv_v', 'translate', 'scale']
-            limits = [(1e-4, 1e-2), (0.00, 0.70), (0.60, 0.97), (0, 0.001), (0, .9), (0, .9), (0, .9), (0, .9)]
+            limits = [(1e-4, 1e-2), (0.00, 0.70), (0.60, 0.98), (0, 0.001), (0, .9), (0, .9), (0, .9), (0, .9)]
             for k, v in zip(keys, limits):
                 hyp[k] = np.clip(hyp[k], v[0], v[1])
 
